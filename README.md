@@ -19,7 +19,10 @@ exported yet.
 Cargo.toml                       crate manifest (no binding-ABI dependency selected yet)
 rust-toolchain.toml              stable + wasm32-unknown-unknown + rustfmt/clippy
 src/lib.rs                       crate root, safety policy, ABI_VERSION + flat export
+tests/abi.rs                     external-consumer integration tests for the public surface
 js/abi-check.mjs                 JS-side ABI check against the raw wasm module
+scripts/pre-publish.sh            full verification gate before a crates.io release
+.github/workflows/ci.yml          runs the same gate on every push and pull request
 docs/README.md                   documentation index
 docs/plan/0.1.0.md                v0.1.0 project plan
 docs/decisions/0001-abi-strategy.md  ADR: flat raw ABI + schema generator
@@ -34,10 +37,22 @@ cargo build --target wasm32-unknown-unknown   # Wasm target
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 node js/abi-check.mjs            # checks __blaze_abi_version() == 0
+sh scripts/pre-publish.sh        # everything above, plus packaging checks
 ```
 
 The `wasm32-unknown-unknown` target and the components above are declared in
-`rust-toolchain.toml`, so rustup installs them automatically on first use.
+`rust-toolchain.toml`, so rustup installs them automatically on first use. The integration tests
+in `tests/abi.rs` link against the crate as an external consumer would, so the published surface is
+checked independently of the crate's own unit tests.
+
+## Before publishing to crates.io
+
+Run `sh scripts/pre-publish.sh`. It runs the same checks as the pre-push hook, builds the
+`wasm32-unknown-unknown` target in both debug and release, runs the JS ABI check, then packages the
+crate and does a `cargo publish --dry-run`. The dry run verifies the `.crate` contents and builds
+them in a clean directory; it does **not** upload anything.
+
+CI runs the same script on every push and pull request, so a red build cannot be published.
 
 ## Git hooks
 
