@@ -11,7 +11,8 @@ decision, not a foregone conclusion — see [`docs/plan/0.1.0.md`](docs/plan/0.1
 `0.1.0` — foundation only. The crate compiles for the host and `wasm32-unknown-unknown`, denies
 unsafe code (with one documented export-attribute exception), exports `ABI_VERSION = 0` through
 `__blaze_abi_version()`, and carries the project plan, ADR and ABI schema. No cache API is
-exported yet.
+exported yet. The [M3 ABI spike](docs/decisions/m3-spike.md) is complete and confirmed the flat
+raw + Loom choice; the `0.1.0` tag is still pending the release gate.
 
 ## Layout
 
@@ -27,6 +28,8 @@ docs/README.md                   documentation index
 docs/plan/0.1.0.md                v0.1.0 project plan
 docs/decisions/0001-abi-strategy.md  ADR: flat raw ABI + schema generator
 docs/decisions/blaze.loom         the ABI contract as a schema
+docs/decisions/m3-spike.md        four-arm ABI benchmark results and decision
+spike/m3/                          M3 arms, harness and reproducible build script
 ```
 
 ## Build & test

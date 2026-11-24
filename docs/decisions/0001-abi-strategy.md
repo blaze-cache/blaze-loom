@@ -1,6 +1,6 @@
 # ADR-0001: Wasm ↔ JS ABI strategy
 
-**Status:** proposed; provisionally accepted for 0.1.0, to be revisited after M3 (M3 may supersede this decision)
+**Status:** accepted for 0.1.0 — confirmed by M3 evidence (see [M3 spike report](m3-spike.md))
 **Date:** 2026-11-22
 **Deciders:** blaze-cache maintainers
 **Relates to:** [v0.1.0 plan](../plan/0.1.0.md), [blaze.loom schema](blaze.loom)
@@ -71,6 +71,23 @@ as unsafe code. The crate therefore uses `#![deny(unsafe_code)]` with one explic
 documented exception on `__blaze_abi_version()`. There are no `unsafe` blocks and no unsafe
 calls; the exception is an export attribute only.
 
+## M3 evidence (2026-11-24)
+
+The four-arm spike is recorded in full in the [M3 spike report](m3-spike.md). All arms use the same
+release profile and `wasm-opt -Oz` pass; the same workload produced:
+
+| Arm | wasm B | glue B | cold ms | get_sync µs | set 1 KB µs |
+|---|---:|---:|---:|---:|---:|
+| flat raw, hand-written | 18,166 | 1,225 | 0.0252 | 0.1986 | 0.3010 |
+| flat raw + Loom | 18,166 | 2,276 | 0.0241 | 0.2246 | 0.3239 |
+| generated glue (wasm-bindgen) | 18,621 | 6,972 | 0.0249 | 0.1831 | 0.2620 |
+| Component Model / WIT (jco) | 19,190 | 110,450 | 1.8008 | 3.2997 | 3.8801 |
+
+Loom adds ~1 KB of glue and no measurable runtime cost over hand-written raw, so the schema-driven
+generator is retained. Generated glue is not rejected on performance — it is within noise — but on
+the independence constraint this project exists to enforce. The Component Model is ~15× slower per
+call with ~90× the glue and is not selected. M3 therefore confirms option 2.5.
+
 ## Consequences
 
 * **Now (0.1.0):** no generated glue, no unsafe blocks, one export attribute exception, loud
@@ -99,4 +116,4 @@ M3 spike must include the check. No value API exists in 0.1.0, so this is a cont
 * [x] no unsafe blocks; one documented export-attribute exception
 * [x] `ABI_VERSION` public, exported, and pinned by a Rust test plus a JS check
 * [x] `blaze.loom` is the ABI decision artifact
-* [ ] M3 spike evidence — pending: four arms, binary size, cold start, call cost, 1 KB set cost
+* [x] M3 spike evidence — four arms, binary size, cold start, call cost, 1 KB set cost: [M3 spike report](m3-spike.md)
