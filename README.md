@@ -15,6 +15,8 @@ unsafe code (with one documented export-attribute exception), exports `ABI_VERSI
 `__blaze_abi_version()`, and carries the project plan, ADR and ABI schema. No cache API is
 exported yet. The [M3 ABI spike](docs/decisions/m3-spike.md) is complete and confirmed the flat
 raw + Loom choice. The `0.1.0` tag (`0f3da91`) is published and the release gate is green.
+The next release, `0.2.0`, adds the engine and the real cache API behind the flat ABI — see
+[`docs/plan/0.2.0.md`](docs/plan/0.2.0.md).
 
 ## Layout
 
@@ -28,6 +30,7 @@ scripts/pre-publish.sh            full verification gate before a crates.io rele
 .github/workflows/ci.yml          runs the same gate on every push and pull request
 docs/README.md                   documentation index
 docs/plan/0.1.0.md                v0.1.0 project plan
+docs/plan/0.2.0.md                v0.2.0 project plan (proposed)
 docs/decisions/0001-abi-strategy.md  ADR: flat raw ABI + schema generator
 docs/decisions/blaze.loom         the ABI contract as a schema
 docs/decisions/m3-spike.md        four-arm ABI benchmark results and decision
