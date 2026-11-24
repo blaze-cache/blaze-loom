@@ -15,22 +15,41 @@ import { resolve } from 'node:path';
 /** Expected value of ABI_VERSION = loom-abi-v1. */
 const LOOM_ABI_EXPECTED = 0;
 
+/**
+ * Check the module's exported ABI version against `expected`, failing loudly on skew.
+ * @param {WebAssembly.Instance} instance
+ * @param {number} expected
+ */
+function checkAbi(instance, expected) {
+  const hostAbi = instance.exports.__blaze_abi_version?.();
+
+  assert.equal(
+    typeof hostAbi,
+    'number',
+    'the wasm module must export __blaze_abi_version()',
+  );
+  assert.equal(
+    hostAbi,
+    expected,
+    `ABI version mismatch: host=${hostAbi} expected=${expected}`,
+  );
+
+  return hostAbi;
+}
+
 const path = resolve(
   process.argv[2] ?? 'target/wasm32-unknown-unknown/debug/blaze_cache_wasm.wasm',
 );
 const bytes = await readFile(path);
 const { instance } = await WebAssembly.instantiate(bytes, {});
-const hostAbi = instance.exports.__blaze_abi_version?.();
 
-assert.equal(
-  typeof hostAbi,
-  'number',
-  'the wasm module must export __blaze_abi_version()',
-);
-assert.equal(
-  hostAbi,
-  LOOM_ABI_EXPECTED,
-  `ABI mismatch: host=${hostAbi} expected=${LOOM_ABI_EXPECTED}`,
-);
+// 1. exports are exactly what 0.1.0 promises
+const names = Object.keys(instance.exports).sort();
+assert.deepEqual(names, ["__blaze_abi_version", "memory"]);
+
+// 2. a wrong expected version must fail loudly
+assert.throws(() => checkAbi(instance, 999), /ABI version mismatch/);
+
+const hostAbi = checkAbi(instance, LOOM_ABI_EXPECTED);
 
 console.log(`ABI OK: host=${hostAbi} (loom-abi-v1)`);

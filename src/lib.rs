@@ -5,8 +5,9 @@
 //! Blaze Cache monorepo. The ABI strategy for this crate is a 0.1.0 design decision — see
 //! [`docs/plan/0.1.0.md`](../../docs/plan/0.1.0.md).
 //!
-//! The crate is `forbid(unsafe_code)` from the start: whatever ABI is chosen, host-supplied
-//! pointers and lengths must be validated in safe Rust before a slice or view is made.
+//! The crate is `deny(unsafe_code)` from the start, with one documented `#[no_mangle]` export
+//! attribute exception: whatever ABI is chosen, host-supplied pointers and lengths must be
+//! validated in safe Rust before a slice or view is made.
 //!
 //! # Status
 //!
@@ -32,6 +33,11 @@ pub extern "C" fn __blaze_abi_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{__blaze_abi_version, ABI_VERSION};
+
+    #[test]
+    fn abi_version_is_pinned() {
+        assert_eq!(ABI_VERSION, 0);
+    }
 
     #[test]
     fn abi_version_is_documented_zero() {
