@@ -1,0 +1,11 @@
+package blaze:spike;
+
+interface store {
+  set: func(k: list<u8>, v: list<u8>);
+  has: func(k: list<u8>) -> bool;
+  get-sync: func(k: list<u8>) -> option<list<u8>>;
+}
+
+world spike {
+  export store;
+}

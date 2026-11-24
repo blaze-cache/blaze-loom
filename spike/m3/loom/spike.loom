@@ -1,0 +1,12 @@
+// blaze-cache M3 spike ABI: raw export signatures consumed by generate.mjs.
+// Scope note: this lowers the raw export layer only; the full blaze.loom high-level
+// contract (resources, views, async) remains 0.2.0 work.
+module blaze_cache_spike
+abi "loom-abi-v1"
+
+export __blaze_abi_version() -> i32
+export reset() -> void
+export alloc(len: u32) -> ptr
+export set(k: ptr, klen: u32, v: ptr, vlen: u32) -> i32
+export has(k: ptr, klen: u32) -> i32
+export get_sync(k: ptr, klen: u32, out: ptr, cap: u32) -> i32
