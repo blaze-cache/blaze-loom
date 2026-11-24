@@ -1,0 +1,38 @@
+[
+  {
+    "arm": "flat-raw",
+    "name": "flat raw, hand-written",
+    "wasm_bytes": 18166,
+    "glue_bytes": 1225,
+    "cold_start_ms": 0.0252,
+    "call_us": 0.1986,
+    "set_1kb_us": 0.301
+  },
+  {
+    "arm": "loom",
+    "name": "flat raw + Loom",
+    "wasm_bytes": 18166,
+    "glue_bytes": 2276,
+    "cold_start_ms": 0.0241,
+    "call_us": 0.2246,
+    "set_1kb_us": 0.3239
+  },
+  {
+    "arm": "wasm-bindgen",
+    "name": "generated glue (wasm-bindgen)",
+    "wasm_bytes": 18621,
+    "glue_bytes": 6972,
+    "cold_start_ms": 0.0249,
+    "call_us": 0.1831,
+    "set_1kb_us": 0.262
+  },
+  {
+    "arm": "component",
+    "name": "Component Model / WIT (jco)",
+    "wasm_bytes": 19190,
+    "glue_bytes": 110450,
+    "cold_start_ms": 1.8008,
+    "call_us": 3.2997,
+    "set_1kb_us": 3.8801
+  }
+]

@@ -1,0 +1,13 @@
+{
+  "name": "blaze-loom-m3-spike",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "M3 ABI spike harness and tooling",
+  "scripts": {
+    "bench": "node harness.mjs"
+  },
+  "dependencies": {
+    "@bytecodealliance/jco": "^1.42.0"
+  }
+}
