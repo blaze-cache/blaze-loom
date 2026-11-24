@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+# Reject non-conventional commit messages without any npm dependency.
+exec "$(dirname "$0")/../scripts/check-commit-msg.sh" "$1"

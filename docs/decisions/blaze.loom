@@ -1,0 +1,38 @@
+// blaze.loom — the ABI decision artifact for blaze-cache-wasm.
+//
+// This file is a schema, not an implementation. It fixes the 0.1.0 ABI contract so the 0.2.0
+// generator and runtime can be built against a stable target. See 0001-abi-strategy.md.
+
+module blaze_cache
+
+abi "loom-abi-v1"          // Rust ABI_VERSION = 0
+
+/// The cache store. Linear: one owner, explicit close.
+resource Cache : linear {
+  fn open(config: CacheConfig) -> Cache
+  fn get_sync(borrow self, key: Key) -> Option<Value>            // hot path, no async
+  fn get(borrow self, key: Key) -> async Option<Value> effects [cancel] // miss may compute
+  fn set(borrow self, key: Key, value: Value) -> void
+  fn has(borrow self, key: Key) -> bool
+  fn delete(borrow self, key: Key) -> bool
+  fn stats(borrow self) -> Stats
+  fn close(self) -> void                                          // consumes the resource
+}
+
+/// Keys are opaque bytes: no UTF-8 encode on the hot path.
+alias Key = buffer
+
+/// Values are views into Wasm memory. A view is valid only until the next cache mutation or
+/// memory.grow; the generated runtime re-creates it on buffer change and rejects stale views
+/// with LoomError('StaleView') when the cache generation advances.
+alias Value = view<buffer>
+
+struct CacheConfig {
+  max_bytes: u64,
+  ttl_ms:    u32,
+  eviction:  EvictionPolicy,
+}
+
+enum EvictionPolicy { Lru, Lfu, Fifo }
+
+struct Stats { hits: u64, misses: u64, evictions: u64, bytes: u64, entries: u64 }

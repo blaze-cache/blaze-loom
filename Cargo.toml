@@ -1,0 +1,18 @@
+[package]
+name = "blaze-cache-wasm"
+description = "Independent WebAssembly binding layer for Blaze Cache (0.1.0 foundation)"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+keywords = ["wasm", "cache", "bindings"]
+categories = ["wasm"]
+
+# `cdylib` is what a Wasm toolchain loads; `rlib` keeps host `cargo test` and `cargo check`
+# working. No binding-ABI dependency is selected yet — see docs/plan/0.1.0.md.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+
+[dev-dependencies]
