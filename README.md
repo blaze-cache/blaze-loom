@@ -14,7 +14,7 @@ path from this foundation to a published, drop-in engine for our projects is in
 unsafe code (with one documented export-attribute exception), exports `ABI_VERSION = 0` through
 `__blaze_abi_version()`, and carries the project plan, ADR and ABI schema. No cache API is
 exported yet. The [M3 ABI spike](docs/decisions/m3-spike.md) is complete and confirmed the flat
-raw + Loom choice; the `0.1.0` tag is still pending the release gate.
+raw + Loom choice. The `0.1.0` tag (`0f3da91`) is published and the release gate is green.
 
 ## Layout
 
