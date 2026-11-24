@@ -1,6 +1,6 @@
 # ADR-0001: Wasm ↔ JS ABI strategy
 
-**Status:** accepted for 0.1.0 (M3 spike evidence still pending)
+**Status:** proposed; provisionally accepted for 0.1.0, to be revisited after M3 (M3 may supersede this decision)
 **Date:** 2026-11-22
 **Deciders:** blaze-cache maintainers
 **Relates to:** [v0.1.0 plan](../plan/0.1.0.md), [blaze.loom schema](blaze.loom)
@@ -13,7 +13,7 @@ without inheriting that coupling. The 0.1.0 plan sets hard constraints:
 
 * no dependency on the current binding crate, `wasm-bindgen`, `js-sys`, `serde-wasm-bindgen` or
   `wasm-bindgen-test`;
-* no unsafe Rust (host-supplied pointers/lengths must be validated before use);
+* no unsafe blocks or calls (one export-attribute lint exception, see below);
 * a public, test-pinned `ABI_VERSION`;
 * no public cache API in 0.1.0 — the ABI itself is the deliverable.
 
@@ -32,6 +32,10 @@ Loom sits between (2) and (3): a flat raw ABI with a schema-driven build-time ge
 **no Rust dependency** — the generator is a build tool, not linked code. The practical choice is
 therefore option 2.5: **flat raw ABI, schema-specified**.
 
+Loom is still a generator, so version skew is not eliminated. It is reduced because the generator
+runs at build time, its output is plain JS/TS with no runtime glue, and the schema, not the tool,
+is the ABI contract. M3 includes Loom as its own arm.
+
 ## Decision
 
 Adopt a **flat raw ABI** for `blaze-cache-wasm`, specified by the [`blaze.loom`](blaze.loom)
@@ -48,8 +52,14 @@ operations, and `Cache` is linear with an explicit `close`. No TS package is shi
 
 A raw ABI normally needs `slice::from_raw_parts`, which is unsafe. To honour the safety goal the
 host copies key bytes into a Wasm-owned arena; Rust reads from a safe `Vec<u8>` the arena owns.
-No host pointer is ever turned into a Rust slice. The cost is one memcpy per call (~5 ns for a
-16 B key); the 1 KB-value case will be measured in M3 before any optimisation is considered.
+No host pointer is ever turned into a Rust slice. The cost is one memcpy per call (expected to be
+small; to be measured in M3); the 1 KB-value case will also be measured in M3 before any
+optimisation is considered.
+
+Copy-in requires an `alloc`-style export so the host knows where to write. That export is added
+with the first key API (0.2.0). Rust owns bounds checks on length; the host never supplies a length
+Rust trusts without validation. Oversized or reentrant writes return an error code rather than
+growing the arena unchecked.
 
 An audited `#[trusted]` unsafe boundary is explicitly deferred to 0.2.0; if profiling justifies
 it, that would be a single documented site, not a blanket relaxation.
@@ -63,10 +73,13 @@ calls; the exception is an export attribute only.
 
 ## Consequences
 
-* **Safety:** no generated glue and no unsafe host-pointer decoding in normal code; one audited
-  export attribute. Views are validated in JS and stale views are rejected by cache generation.
-* **Portability:** a flat `(ptr, len)` ABI works on V8, JSC and SpiderMonkey; older engines need
-  no extra build profile at this stage because no typed-binding runtime is used.
+* **Now (0.1.0):** no generated glue, no unsafe blocks, one export attribute exception, loud
+  version check.
+* **Contract for 0.2.0 (not implemented):** JS-side view validation and generation-based
+  stale-view rejection.
+* **Portability:** a flat `(ptr, len)` ABI is expected to work on V8, JSC and SpiderMonkey; to be
+  verified in M3. Older engines need no extra build profile at this stage because no typed-binding
+  runtime is used.
 * **Binary size / cold start:** no glue code linked; 0.1.0's raw module exports only `memory`
   and `__blaze_abi_version`.
 * **DX:** TypeScript bindings are generated from `blaze.loom` in a later version, not hand-
@@ -86,4 +99,4 @@ M3 spike must include the check. No value API exists in 0.1.0, so this is a cont
 * [x] no unsafe blocks; one documented export-attribute exception
 * [x] `ABI_VERSION` public, exported, and pinned by a Rust test plus a JS check
 * [x] `blaze.loom` is the ABI decision artifact
-* [ ] M3 spike evidence — pending: three options, binary size, cold start, `get_sync` cost, 1 KB set cost
+* [ ] M3 spike evidence — pending: four arms, binary size, cold start, call cost, 1 KB set cost
