@@ -1,1 +1,7 @@
 /target
+/spike/m3/node_modules/
+/spike/m3/*/target/
+/spike/m3/loom/generated/
+/spike/m3/wasm-bindgen/pkg/
+/spike/m3/component/out/
+/spike/m3/component/component.wasm

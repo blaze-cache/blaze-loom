@@ -7,6 +7,7 @@ rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/blaze-cache/blaze-loom"
 readme = "README.md"
+exclude = ["/spike"]
 keywords = ["wasm", "cache", "bindings"]
 categories = ["wasm"]
 
