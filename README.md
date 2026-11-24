@@ -4,7 +4,9 @@ An **independent** Rust project that will become Blaze Cache's future WebAssembl
 
 It is deliberately separate from the current monorepo crate (`blaze-cache/crates/blaze-cache-wasm`)
 and does not depend on the `wasm-bindgen` glue used there. The binding ABI is a 0.1.0 design
-decision, not a foregone conclusion — see [`docs/plan/0.1.0.md`](docs/plan/0.1.0.md).
+decision, not a foregone conclusion — see [`docs/plan/0.1.0.md`](docs/plan/0.1.0.md). The full
+path from this foundation to a published, drop-in engine for our projects is in
+[`docs/plan/ADOPTION-ROADMAP.md`](docs/plan/ADOPTION-ROADMAP.md).
 
 ## Status
 
