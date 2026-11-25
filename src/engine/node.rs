@@ -1,7 +1,7 @@
 //! The intrusive node that links an entry into the SIEVE queue.
 
-use smallvec::SmallVec;
 use crate::clock::Instant;
+use smallvec::SmallVec;
 
 /// One cached entry plus its queue bookkeeping.
 ///

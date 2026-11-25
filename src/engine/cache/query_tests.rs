@@ -288,9 +288,7 @@ fn a_prefix_cursor_seeks_the_contiguous_prefix_region() {
     };
     assert_eq!(
         keys(&f),
-        vec![
-            "k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09"
-        ]
+        vec!["k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09"]
     );
 
     // A cursor before the prefix region adds nothing the prefix bound does not already

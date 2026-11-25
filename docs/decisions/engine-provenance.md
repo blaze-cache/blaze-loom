@@ -91,7 +91,10 @@ sh scripts/sync-core.sh [path/to/blaze-cache]
 3. Copies `src/**.rs` into `src/engine/` (lib.rs → mod.rs) and `tests/allocations.rs` to
    `tests/engine_allocations.rs`.
 4. Rewrites `use blaze_cache_core::` → `use blaze_cache_wasm::engine::` in the integration test.
-5. Prints a diffstat so the operator sees exactly what moved.
+5. Runs `cargo fmt --all`, because upstream's style is not this repo's and the gate runs
+   `cargo fmt --check` — the script's fixed point must be gate-clean (copy → rewrite → fmt
+   is idempotent: rustfmt normalizes its own output on the next run).
+6. Prints a diffstat so the operator sees exactly what moved.
 
 To move the pin: land the fix upstream, update the commit in **both** this file and
 `scripts/sync-core.sh`, run the sync, run `sh scripts/pre-publish.sh`, and commit all three

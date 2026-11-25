@@ -671,11 +671,9 @@ fn drop_log_records_expirations_reached_through_eviction() {
     assert_eq!(drops[0].reason, DropReason::Expired);
     // The other slot freed by the sweep was a genuine eviction... or nothing —
     // assert the invariant that matters: only self-initiated drops are logged.
-    assert!(
-        drops
-            .iter()
-            .all(|d| matches!(d.reason, DropReason::Expired | DropReason::Evicted))
-    );
+    assert!(drops
+        .iter()
+        .all(|d| matches!(d.reason, DropReason::Expired | DropReason::Evicted)));
 }
 
 #[test]
@@ -741,12 +739,10 @@ fn touch_installs_a_deadline_even_when_no_entry_has_one_yet() {
     // A renewal while other entries *do* carry deadlines keeps working the same way.
     cache.insert_with("other", 2, EntryOptions::new().ttl(Duration::from_secs(5)));
     assert!(cache.touch("k", Some(Duration::from_secs(30))));
-    assert!(
-        cache
-            .ttl("k")
-            .unwrap()
-            .is_some_and(|ttl| ttl <= Duration::from_secs(30)),
-    );
+    assert!(cache
+        .ttl("k")
+        .unwrap()
+        .is_some_and(|ttl| ttl <= Duration::from_secs(30)),);
 
     // Zero still means "drop the deadline" — untouched semantics.
     assert!(cache.touch("k", Some(Duration::ZERO)));

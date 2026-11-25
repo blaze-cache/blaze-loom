@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use crate::clock::Instant;
 
-use crate::engine::DEFAULT_CAPACITY;
 use crate::engine::entry::EntryOptions;
 use crate::engine::eviction::Sieve;
 use crate::engine::node::Node;
@@ -17,6 +16,7 @@ use crate::engine::query::{
 };
 use crate::engine::stats::CacheStats;
 use crate::engine::tags::TagIndex;
+use crate::engine::DEFAULT_CAPACITY;
 
 /// Largest index reservation made by [`Cache::new`] before any entry is stored.
 ///

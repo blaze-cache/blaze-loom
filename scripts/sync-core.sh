@@ -90,6 +90,11 @@ if grep -rn 'crate::engine::engine::' src/engine; then
   fail "double-rewritten crate path"
 fi
 
+# --- format: upstream's style is not this repo's; the gate runs `cargo fmt --check` ---
+# Run last so the script's fixed point is gate-clean: copy -> rewrite -> fmt is
+# idempotent (rustfmt normalizes its own output on the next run).
+cargo fmt --all
+
 printf 'sync-core: done. state vs last commit:\n'
 git status --short -- src/engine tests/engine_allocations.rs
 git diff --stat -- src/engine tests/engine_allocations.rs || true
