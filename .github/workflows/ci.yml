@@ -19,5 +19,10 @@ jobs:
         with:
           node-version: '20'
 
+      # scripts/pre-publish.sh optimizes the release module with wasm-opt and runs the
+      # contract check + harness against that exact artifact; ubuntu-latest has no binaryen.
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
       - name: Full pre-publish gate
         run: sh scripts/pre-publish.sh

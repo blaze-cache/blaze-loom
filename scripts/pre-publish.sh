@@ -3,6 +3,13 @@
 # Mirrors .githooks/pre-push, then checks the release profile and the packaged crate itself.
 set -eu
 
+# The optimized release module is the artifact that ships, so binaryen is a gate
+# prerequisite (CI installs it via apt; locally: brew install binaryen).
+command -v wasm-opt >/dev/null 2>&1 || {
+  printf 'pre-publish: wasm-opt not found — install binaryen (brew install binaryen; CI: apt-get install binaryen)\n' >&2
+  exit 1
+}
+
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
