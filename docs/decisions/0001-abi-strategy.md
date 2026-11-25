@@ -94,9 +94,10 @@ call with ~90× the glue and is not selected. M3 therefore confirms option 2.5.
   version check.
 * **Contract for 0.2.0 (not implemented):** JS-side view validation and generation-based
   stale-view rejection.
-* **Portability:** a flat `(ptr, len)` ABI is expected to work on V8, JSC and SpiderMonkey; to be
-  verified in M3. Older engines need no extra build profile at this stage because no typed-binding
-  runtime is used.
+* **Portability:** a flat `(ptr, len)` ABI is expected to work on V8, JSC and SpiderMonkey; M3
+  verified it on Node/V8 only — a full browser matrix is explicitly 0.4.0 work (see the
+  [roadmap](../plan/ADOPTION-ROADMAP.md) Phase 3). Older engines need no extra build profile at
+  this stage because no typed-binding runtime is used.
 * **Binary size / cold start:** no glue code linked; 0.1.0's raw module exports only `memory`
   and `__blaze_abi_version`.
 * **DX:** TypeScript bindings are generated from `blaze.loom` in a later version, not hand-
@@ -107,8 +108,30 @@ call with ~90× the glue and is not selected. M3 therefore confirms option 2.5.
 
 A `(ptr, len)` returned by `get_sync` is valid only until the next cache mutation or a
 `memory.grow`. The JS runtime must re-create views when `memory.buffer` changes and invalidate
-views when the cache generation advances. The schema's `view<buffer>` alias documents this; the
-M3 spike must include the check. No value API exists in 0.1.0, so this is a contract for 0.2.0.
+views when the cache generation advances. The schema's `view<buffer>` alias documents this. The
+M3 spike explicitly scoped this out (its store has no views or generations — see the
+[spike report](m3-spike.md) §Limitations), so the check lands with the value API: the generation
+counter ships in 0.2.0 and the runtime-side staleness check in 0.3.0. No value API exists in
+0.1.0.
+
+## v2 section (0.2.0)
+
+0.2.0 does not rewrite this ADR. The strategy (flat raw ABI, schema-specified, no generated
+glue) is unchanged; what changed is the contract it points at:
+
+* **Schema:** [`blaze-v2.loom`](blaze-v2.loom) is the 0.2.0 contract; [`blaze.loom`](blaze.loom)
+  stays byte-for-byte as tagged in 0.1.0 (D3, [ADR-0004](0004-abi-v2.md)).
+* **`ABI_VERSION = 1`** (`loom-abi-v2`), pinned in Rust, JS and CI. `__blaze_abi_version()` is
+  still the host's first call.
+* **Host-input strategy (Approach B) is now implemented:** the arena exports land in 0.2.0
+  (`__blaze_arena_alloc` + copy-in, per §Host-input strategy above), with hostile-pointer
+  property tests.
+* **View staleness** gets its enforcement mechanism in 0.2.0: a per-cache generation counter
+  (`__blaze_generation`) that the 0.3.0 runtime checks before dereferencing (§View-detachment
+  rule above).
+* **Engine source** is settled separately: vendored pinned snapshot
+  ([ADR-0002](0002-engine-source.md)); **value representation** is handles + JS-owned `Map`
+  ([ADR-0003](0003-value-representation.md)).
 
 ## Compliance with 0.1.0 acceptance criteria
 

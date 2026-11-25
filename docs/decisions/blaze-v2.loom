@@ -1,0 +1,87 @@
+// blaze-v2.loom — the 0.2.0 ABI contract for blaze-cache-wasm.
+//
+// loom-abi-v2. Companion to, not a replacement for, blaze.loom (loom-abi-v1), which stays
+// byte-for-byte as tagged in 0.1.0 — see 0004-abi-v2.md (D3). Rust ABI_VERSION = 1.
+//
+// The v2 schema declares the full high-level Cache resource (including async get). Only the
+// sync subset marked [0.2.0] has wasm exports in 0.2.0; the rest lowers to the TS runtime in
+// 0.3.0 (D4) and gains exports in 0.3.0–0.4.0.
+
+module blaze_cache
+
+abi "loom-abi-v2"          // Rust ABI_VERSION = 1
+
+/// The cache store. Linear: one owner, explicit close.
+resource Cache : linear {
+  fn open(config: CacheConfig) -> Cache                            [0.2.0]
+  fn get_sync(borrow self, key: Key) -> Option<Value>              [0.2.0] // hot path, no async
+  fn get(borrow self, key: Key) async Option<Value> effects [cancel]       // miss may compute; TS-side in 0.3.0
+  fn set(borrow self, key: Key, value: Value, ttl: Option<Duration>, tags: list<string>) [0.2.0]
+  fn has(borrow self, key: Key) -> bool                            [0.2.0]
+  fn delete(borrow self, key: Key) -> bool                         [0.2.0]
+  fn stats(borrow self) -> Stats                                   [0.2.0]
+  fn close(self) -> void                                           [0.2.0] // consumes the resource
+}
+
+/// Host-provided monotonic clock. wasm32 has no clock of its own — std::time::Instant traps
+/// there and web-time's wasm backend is wasm-bindgen glue (0002-engine-source.md) — so the
+/// host calls tick(now_ms) before each ABI call; Instant::now() then returns that value.
+/// Monotonic milliseconds (performance.now() or Date.now()). No-op off-wasm.
+fn tick(now_ms: f64) [0.2.0]
+
+/// Keys are opaque bytes: no UTF-8 encode on the hot path.
+alias Key = buffer
+
+/// Values cross in one of two kinds (D2, 0003-value-representation.md):
+///   kind 0 = Ref   — value_ref_or_ptr is an opaque u32 handle; value_len is ignored.
+///                     Wasm never dereferences it; JS owns the object in Map<id, V>.
+///   kind 1 = Bytes — value_ref_or_ptr is an arena pointer, value_len the byte count.
+/// Bytes results returned by get_sync are views into Wasm memory: valid only until the next
+/// cache mutation or memory.grow. The host checks __blaze_generation before dereferencing and
+/// rejects a stale view (error 3) rather than reading detached/wrong memory.
+alias Value = view<buffer>
+
+/// v2 config is exactly what the engine implements (evidence table, 0.2.0 plan):
+/// 8 bytes little-endian, two u32 slots. No max_bytes (the core is entry-capacity, not a byte
+/// budget) and no cache-wide ttl (TTL is per-entry, passed to set).
+struct CacheConfig {
+  capacity: u32,        // max entries; the engine clamps to >= 1
+  eviction:  EvictionPolicy,
+}
+
+/// D6: truthful single-variant enum. The core's eviction is fixed SIEVE (eviction.rs:25);
+/// Lru/Lfu/Fifo from v1 are removed, not implemented. v3 adds variants when the engine does.
+enum EvictionPolicy { Sieve }
+
+/// D7: 7-field superset matching the engine's CacheStats (stats.rs:10), fixed 56-byte layout,
+/// seven little-endian u64 fields in exactly this order. size and capacity are ENTRY counts.
+/// v1's bytes/entries do not exist in the engine and are dropped, not invented.
+struct Stats {
+  hits:         u64,
+  misses:       u64,
+  evictions:    u64,
+  expirations:  u64,
+  invalidations: u64,
+  size:         u64,    // live entries
+  capacity:     u64,    // max entries
+}
+
+/// Tags on set: flat buffer of repeated [u32 byte_len][UTF-8 bytes] records.
+/// Zero-length buffer means no tags. Malformed records are BAD_ARG, never a trap.
+alias Tags = buffer
+
+/// One stable i32 error enum for every flat export. Asserted in the schema and in tests.
+/// No panic crosses the boundary; release keeps panic = "abort".
+enum ErrorCode : i32 {
+  OK          = 0,   // operation succeeded
+  MISS        = 1,   // key absent or expired
+  BAD_ARG     = 2,   // bad id, out-of-bounds pointer/length, malformed config/tags, unknown kind
+  STALE_VIEW  = 3,   // generation advanced or memory.buffer swapped since the view was taken
+  CLOSED      = 4,   // cache id was closed
+  OOM         = 5,   // arena allocation failed
+}
+
+/// Each cache has a u64 generation, incremented on every mutation (set, delete, clear, close).
+/// __blaze_generation(id) returns 0 for an unknown id. A returned view is valid only until the
+/// next mutation or a memory.grow; the 0.3.0 runtime checks before dereferencing.
+alias Generation = u64
