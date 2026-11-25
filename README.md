@@ -18,8 +18,8 @@ pinned `blaze-cache-core` snapshot (kept in sync by `scripts/sync-core.sh`), exp
 `generation`, `tick` and the arena allocator — with `ABI_VERSION = 1`, and round-trips a `Ref`
 handle and raw bytes through `js/harness.mjs` with **no wasm-bindgen and no unsafe code** (one
 documented `#[no_mangle]` exception class). Hostile-pointer property tests live in
-`tests/abi.rs`. The `0.1.0` foundation tag (`0f3da91`) is published; the `0.2.0` release
-record — including the tag commit — is in
+`tests/abi.rs`. The `0.1.0` foundation tag (`0f3da91`) and the `0.2.0` tag (`605cab1`) are
+published; the `0.2.0` release record is in
 [`docs/plan/0.2.0.md`](docs/plan/0.2.0.md#release-record).
 
 ## Layout
@@ -41,7 +41,7 @@ scripts/pre-publish.sh            full verification gate before a crates.io rele
 .github/workflows/ci.yml          runs the same gate on every push and pull request
 docs/README.md                   documentation index
 docs/plan/0.1.0.md                v0.1.0 project plan
-docs/plan/0.2.0.md                v0.2.0 project plan (active)
+docs/plan/0.2.0.md                v0.2.0 project plan (current release)
 docs/decisions/0001-abi-strategy.md  ADR: flat raw ABI + schema generator
 docs/decisions/blaze.loom         the frozen loom-abi-v1 contract
 docs/decisions/blaze-v2.loom      the loom-abi-v2 contract (0.2.0)
