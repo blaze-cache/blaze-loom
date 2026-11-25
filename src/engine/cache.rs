@@ -1,0 +1,1283 @@
+//! The cache itself: slab storage, hash index, SIEVE queue and tag bookkeeping.
+
+use std::borrow::Borrow;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
+use std::ops::Bound;
+use std::time::Duration;
+
+use crate::clock::Instant;
+
+use crate::engine::DEFAULT_CAPACITY;
+use crate::engine::entry::EntryOptions;
+use crate::engine::eviction::Sieve;
+use crate::engine::node::Node;
+use crate::engine::query::{
+    QueryError, QueryFilter, QueryIndex, QueryKeysResult, QueryRow, StringQueryIndex,
+};
+use crate::engine::stats::CacheStats;
+use crate::engine::tags::TagIndex;
+
+/// Largest index reservation made by [`Cache::new`] before any entry is stored.
+///
+/// `capacity` is a ceiling, not a promise that the caller will fill it: the wasm binding
+/// accepts a JS number and clamps hostile values to a million, and reserving a million
+/// buckets up front costs ~69 MB on the host (tens of MB of wasm linear memory). Starting
+/// small and letting the hash map grow geometrically keeps construction cheap without
+/// changing the number of entries the cache can hold.
+const INITIAL_INDEX_RESERVATION: usize = 1024;
+
+/// Remaining lifetime and tags of a live entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryMeta {
+    /// Time left before the entry expires, or `None` when it never expires.
+    pub ttl_remaining: Option<Duration>,
+    /// Tags currently attached to the entry.
+    pub tags: Vec<String>,
+}
+
+/// A borrowed snapshot of one live entry, as returned by [`Cache::entries`].
+#[derive(Debug)]
+pub struct EntryView<'a, K, V> {
+    pub key: &'a K,
+    pub value: &'a V,
+    /// Stable entry identity (see [`Cache::get_by_id`]).
+    pub id: u32,
+    pub meta: EntryMeta,
+}
+
+/// Why the cache dropped an entry **on its own** — never the result of an explicit
+/// [`remove`](Cache::remove), [`invalidate_tags`](Cache::invalidate_tags) or
+/// [`clear`](Cache::clear), which the caller already knows about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// The cache was over [`capacity`](Cache::capacity) and SIEVE picked this entry.
+    Evicted,
+    /// The entry's TTL elapsed and something touched it (a read, or a capacity sweep
+    /// that happened to reach it first).
+    Expired,
+}
+
+/// An entry the cache reclaimed by itself, as handed back by [`Cache::drain_drops`].
+///
+/// The pair is returned by value — the same owned key/value the slab held — so no `Clone`
+/// bound is needed anywhere on the host side.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Dropped<K, V> {
+    pub key: K,
+    pub value: V,
+    /// The id of the dropped entry, so an external value store can release it without a key
+    /// lookup (JS-authoritative mode).
+    pub id: u32,
+    pub reason: DropReason,
+}
+
+/// An in-memory cache with per-entry TTLs, tag invalidation and SIEVE eviction.
+///
+/// `K` must be cheaply cloneable: every key is stored once in the hash index and once inside
+/// its slab node so that eviction can unregister itself without re-hashing. Keys are almost
+/// always short strings, so this is a good trade.
+///
+/// # Behaviour
+///
+/// * Lookups take `&mut self` because a hit marks the entry as *visited* for SIEVE — the same
+///   trade [`lru`](https://docs.rs/lru) makes.
+/// * [`len`](Self::len) is `O(1)` and counts entries that have expired but were not pruned yet.
+/// * Writes never allocate more than one node; capacity pressure evicts during the write.
+///
+/// ```rust
+/// use std::time::Duration;
+/// use blaze_cache_wasm::engine::{Cache, EntryOptions};
+///
+/// let mut cache = Cache::new(2);
+/// cache.insert("a", 1);
+/// cache.insert("b", 2);
+/// cache.insert("c", 3); // "a" is evicted: nothing was visited
+/// assert_eq!(cache.get("a"), None);
+///
+/// cache.get("b"); // mark "b" visited
+/// cache.insert_with("d", 4, EntryOptions::new().ttl(Duration::from_secs(5)));
+/// assert_eq!(cache.get("c"), None, "the unvisited entry goes first");
+/// assert_eq!(cache.get("b"), Some(&2));
+/// ```
+#[derive(Debug)]
+pub struct Cache<K, V> {
+    nodes: Vec<Option<Node<K, V>>>,
+    free: Vec<usize>,
+    /// Key → slab slot.
+    ///
+    /// Uses [`foldhash`] rather than std's default SipHash-1-3: this map is probed on every
+    /// read and write, cache keys are short strings, and foldhash keeps per-process random
+    /// seeding (hash-flooding resistance) at a fraction of SipHash's cost.
+    index: HashMap<K, usize, foldhash::fast::RandomState>,
+    /// Stable id → slab slot. Unlike slab slots, ids are never reused, so a host holding a
+    /// `Map<id, V>` can never see a stale id alias a newer entry.
+    ///
+    /// **Empty and untouched in the default mode.** Maintaining it costs a hash on every
+    /// insert and every release, so it is enabled only by [`enable_ids`](Self::enable_ids),
+    /// which JS-authoritative mode calls before the first write.
+    by_id: HashMap<u32, usize, foldhash::fast::RandomState>,
+    /// Whether `by_id` is live. Off by default; the hot path pays one branch.
+    track_ids: bool,
+    /// Next id to hand out. Wraps only after 2³² writes; on wrap the oldest id is evicted from
+    /// this index before reuse so no two live entries ever share one.
+    next_id: u32,
+    queue: Sieve,
+    tags: TagIndex,
+    capacity: usize,
+    stats: CacheStats,
+    /// How many stored entries carry an `expires_at` deadline.
+    ///
+    /// This is the fast-path predicate: when it is `0`, no entry can ever be expired, so the
+    /// read paths skip `Instant::now()` — on wasm that call reads the host-ticked clock
+    /// (`__blaze_tick`), work per operation that avoids it. Maintained exclusively through
+    /// [`shift_ttl`](Self::shift_ttl) so every deadline change flows through one place.
+    ttl_count: usize,
+    /// Opt-in log of self-initiated drops (evictions and expirations).
+    ///
+    /// Empty — and never pushed to — unless [`set_drop_tracking`](Self::set_drop_tracking)
+    /// turned it on, so the default hot path pays only a predictable `bool` branch at the
+    /// moment an entry dies (never per read/write). A [`VecDeque`] because the soft cap
+    /// sacrifices the oldest record: `pop_front` stays `O(1)` where `Vec::remove(0)`
+    /// would shift the whole log on every drop once it fills.
+    drops: VecDeque<Dropped<K, V>>,
+    /// Whether `drops` is being collected. Off by default.
+    track_drops: bool,
+    /// Opt-in ordered indexes for prefix/tag/TTL queries. `None` by default: an opted-out
+    /// cache allocates nothing extra and every mutation pays a single `Option` branch.
+    query_index: Option<Box<dyn QueryIndex<K>>>,
+}
+
+impl<K, V> Cache<K, V>
+where
+    K: Clone + Hash + Eq,
+{
+    /// Creates a cache holding at most `capacity` entries.
+    ///
+    /// `capacity` is clamped to at least `1`.
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            nodes: Vec::new(),
+            free: Vec::new(),
+            index: HashMap::with_capacity_and_hasher(
+                capacity.min(INITIAL_INDEX_RESERVATION),
+                foldhash::fast::RandomState::default(),
+            ),
+            by_id: HashMap::default(),
+            track_ids: false,
+            next_id: 0,
+            queue: Sieve::new(),
+            tags: TagIndex::default(),
+            capacity,
+            stats: CacheStats::default(),
+            ttl_count: 0,
+            drops: VecDeque::new(),
+            track_drops: false,
+            query_index: None,
+        }
+    }
+
+    /// Enables the stable-id index used by JS-authoritative storage.
+    ///
+    /// Off by default because maintaining it costs a hash on every insert and release. Call
+    /// before the first write; the map is reserved once, then kept in step by `insert_at` and
+    /// `release`. Enabling on an already-populated cache backfills the index from the slab.
+    pub fn enable_ids(&mut self) {
+        if self.track_ids {
+            return;
+        }
+        self.track_ids = true;
+        self.by_id
+            .reserve(self.index.len().max(INITIAL_INDEX_RESERVATION));
+        for (idx, slot) in self.nodes.iter().enumerate() {
+            if let Some(node) = slot {
+                self.by_id.insert(node.id, idx);
+            }
+        }
+    }
+
+    /// Starts (or stops) recording self-initiated drops — see [`drain_drops`](Self::drain_drops).
+    ///
+    /// Turning it off also clears anything recorded so far. Costs one branch per dropped
+    /// entry while enabled and nothing observable while disabled.
+    pub fn set_drop_tracking(&mut self, enabled: bool) {
+        self.track_drops = enabled;
+        if !enabled {
+            self.drops.clear();
+        }
+    }
+
+    /// `true` while the drop log is being collected.
+    #[must_use]
+    pub fn drop_tracking(&self) -> bool {
+        self.track_drops
+    }
+
+    /// Takes everything recorded since the last drain: entries the cache reclaimed by
+    /// itself, with the reason.
+    ///
+    /// Only fills while [`set_drop_tracking`](Self::set_drop_tracking) is on. Explicit
+    /// [`remove`](Self::remove), [`invalidate_tags`](Self::invalidate_tags),
+    /// [`clear`](Self::clear) and [`prune`](Self::prune) never appear here — the caller
+    /// initiated those and already knows the outcome.
+    pub fn drain_drops(&mut self) -> Vec<Dropped<K, V>> {
+        std::mem::take(&mut self.drops).into()
+    }
+
+    /// Records a self-initiated drop when tracking is on.
+    ///
+    /// Explicit `remove` / `invalidate_tags` / `clear` / `prune` never call this — the
+    /// caller initiated those and already knows the outcome.
+    fn log_drop(&mut self, id: u32, key: K, value: V, reason: DropReason) {
+        if self.track_drops {
+            // Soft cap: a listener that stops draining must not grow this forever.
+            // Older records are sacrificed first (FIFO semantics).
+            const MAX_DROPS: usize = 64 * 1024;
+            if self.drops.len() >= MAX_DROPS {
+                self.drops.pop_front();
+            }
+            self.drops.push_back(Dropped {
+                id,
+                key,
+                value,
+                reason,
+            });
+        }
+    }
+
+    /// Maximum number of entries. See [`DEFAULT_CAPACITY`].
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Live entries. May include entries whose TTL elapsed but that nobody touched yet.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// `true` when no entry is stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// Number of stored entries that are present **and** not expired.
+    #[must_use]
+    pub fn live_len(&self) -> usize {
+        if self.ttl_count == 0 {
+            return self.index.len();
+        }
+        let now = Instant::now();
+        let mut count = 0;
+        let mut cursor = self.queue_head();
+        while let Some(idx) = cursor {
+            let node = self.nodes[idx].as_ref().expect("live slot");
+            cursor = node.next;
+            if !node.is_expired(now) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Current counters.
+    #[must_use]
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            size: self.index.len(),
+            capacity: self.capacity,
+            ..self.stats
+        }
+    }
+
+    /// Zeroes the cumulative counters. Does not touch stored entries.
+    pub fn reset_stats(&mut self) {
+        self.stats = CacheStats::default();
+    }
+
+    /// Shrinks (or grows) the cache, evicting entries until it fits the new capacity.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+        while self.index.len() > self.capacity && self.evict_one().is_some() {}
+    }
+
+    // ---------------------------------------------------------------- reads
+
+    /// Fetches a value, marking it *visited* for SIEVE.
+    ///
+    /// An expired entry counts as a miss and is removed eagerly.
+    pub fn get<Q>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let Some(&idx) = self.index.get(key) else {
+            self.stats.misses += 1;
+            return None;
+        };
+        // Fast path: with no deadline on any entry nothing can be expired, so the clock is
+        // skipped entirely. On wasm `Instant::now()` reads the host-ticked clock
+        // (`__blaze_tick`) — work per read that this avoids.
+        if self.ttl_count > 0 {
+            let now = Instant::now();
+            if self.nodes[idx].as_ref().expect("live slot").is_expired(now) {
+                self.stats.expirations += 1;
+                self.stats.misses += 1;
+                let (key, value, id) = self.free(idx);
+                self.log_drop(id, key, value, DropReason::Expired);
+                return None;
+            }
+        }
+        // One slot access for both the visited bit and the value: a single bounds check and
+        // a single `expect` where the old code re-indexed the slab twice.
+        let node = self.nodes[idx].as_mut().expect("live slot");
+        node.visited = true;
+        self.stats.hits += 1;
+        Some(&node.value)
+    }
+
+    /// Fetches a value **without** recording a hit or a miss, and without marking the entry
+    /// visited for SIEVE.
+    pub fn peek<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let idx = *self.index.get(key)?;
+        let node = self.nodes[idx].as_ref().expect("live slot");
+        if self.ttl_count == 0 {
+            return Some(&node.value);
+        }
+        if node.expires_at.is_some() && node.is_expired(Instant::now()) {
+            return None;
+        }
+        Some(&node.value)
+    }
+
+    /// [`get`](Self::get) followed by a clone — convenient across API boundaries.
+    pub fn get_cloned<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+        V: Clone,
+    {
+        self.get(key).cloned()
+    }
+
+    /// Looks up a live entry by its stable [`id`](EntryView::id) instead of by key.
+    ///
+    /// This is the hot path for JS-authoritative storage: the host holds the value in a JS
+    /// `Map<id, V>` and only needs wasm to answer "is this id still alive, and was it read?".
+    /// No key string crosses the boundary. An expired id counts as a miss and is reclaimed
+    /// eagerly, exactly as [`get`](Self::get) does for an expired key.
+    pub fn get_by_id(&mut self, id: u32) -> bool {
+        let Some(&idx) = self.by_id.get(&id) else {
+            self.stats.misses += 1;
+            return false;
+        };
+        if self.ttl_count > 0 {
+            let now = Instant::now();
+            if self.nodes[idx].as_ref().expect("live slot").is_expired(now) {
+                self.stats.expirations += 1;
+                self.stats.misses += 1;
+                let (key, value, id) = self.free(idx);
+                self.log_drop(id, key, value, DropReason::Expired);
+                return false;
+            }
+        }
+        self.nodes[idx].as_mut().expect("live slot").visited = true;
+        self.stats.hits += 1;
+        true
+    }
+
+    /// [`peek`](Self::peek) by stable id: observational, no stats and no eviction bookkeeping.
+    #[must_use]
+    pub fn peek_by_id(&self, id: u32) -> bool {
+        let Some(&idx) = self.by_id.get(&id) else {
+            return false;
+        };
+        let node = self.nodes[idx].as_ref().expect("live slot");
+        if self.ttl_count == 0 {
+            return true;
+        }
+        !node.is_expired(Instant::now())
+    }
+
+    /// `true` when `id` is present and not expired. Never mutates the cache or its counters.
+    #[must_use]
+    pub fn has_by_id(&self, id: u32) -> bool {
+        self.peek_by_id(id)
+    }
+
+    /// Full view of a live entry by id. Used by hosts that own the value but still need the
+    /// key/TTL/tag metadata to answer `entry(id)` and persistence queries.
+    pub fn entry_by_id(&self, id: u32) -> Option<EntryView<'_, K, V>> {
+        let idx = *self.by_id.get(&id)?;
+        let node = self.nodes[idx].as_ref().expect("live slot");
+        let now = if self.ttl_count == 0 {
+            None
+        } else {
+            let now = Instant::now();
+            if node.is_expired(now) {
+                return None;
+            }
+            Some(now)
+        };
+        Some(EntryView {
+            key: &node.key,
+            value: &node.value,
+            id: node.id,
+            meta: self.meta_for(node, now),
+        })
+    }
+
+    /// Records a miss without a lookup, for hosts that own the key index (JS-authoritative
+    /// mode) and therefore never send an absent key across the boundary.
+    pub fn record_miss(&mut self) {
+        self.stats.misses += 1;
+    }
+
+    /// `true` when the key is present **and** not expired. Never mutates the cache.
+    #[must_use]
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.index.get(key).is_some_and(|&idx| {
+            // `ttl_count == 0` means no deadline exists anywhere, so the check below could
+            // only ever confirm "not expired" — skip the clock call (see `get`).
+            self.ttl_count == 0
+                || !self.nodes[idx]
+                    .as_ref()
+                    .expect("live slot")
+                    .is_expired(Instant::now())
+        })
+    }
+
+    /// TTL left and tags for one key, without touching LRU/SIEVE state.
+    pub fn meta<Q>(&self, key: &Q) -> Option<EntryMeta>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let idx = *self.index.get(key)?;
+        let node = self.nodes[idx].as_ref().expect("live slot");
+        if self.ttl_count == 0 {
+            // No deadline exists, so `ttl_remaining` is `None` for every node and the
+            // expired check cannot trigger — no clock needed (see `get`).
+            return Some(self.meta_for(node, None));
+        }
+        let now = Instant::now();
+        if node.is_expired(now) {
+            return None;
+        }
+        Some(self.meta_for(node, Some(now)))
+    }
+
+    /// Time left on `key`'s deadline.
+    pub fn ttl<Q>(&self, key: &Q) -> Option<Option<Duration>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let idx = *self.index.get(key)?;
+        let node = self.nodes[idx].as_ref().expect("live slot");
+        if self.ttl_count == 0 {
+            return Some(ttl_remaining(node, None));
+        }
+        let now = Instant::now();
+        if node.is_expired(now) {
+            return None;
+        }
+        Some(ttl_remaining(node, Some(now)))
+    }
+
+    /// Full view of one key — value, remaining TTL and tags — without touching statistics or
+    /// the eviction state. Used by persistence layers to serialise a single entry.
+    pub fn entry<Q>(&self, key: &Q) -> Option<EntryView<'_, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let idx = *self.index.get(key)?;
+        let node = self.nodes[idx].as_ref().expect("live slot");
+        let now = if self.ttl_count == 0 {
+            None // no deadline anywhere: cannot be expired, `ttl_remaining` is `None`
+        } else {
+            let now = Instant::now();
+            if node.is_expired(now) {
+                return None;
+            }
+            Some(now)
+        };
+        Some(EntryView {
+            key: &node.key,
+            value: &node.value,
+            id: node.id,
+            meta: self.meta_for(node, now),
+        })
+    }
+
+    /// Snapshot of every live (non-expired) entry, oldest first.
+    ///
+    /// Used by persistence layers to serialise the cache in one pass.
+    pub fn entries(&self) -> Vec<EntryView<'_, K, V>> {
+        // No deadline anywhere → nothing can be expired, so the walk takes no clock (on
+        // wasm that call reads the host-ticked clock). See `get` for the rationale.
+        let now = (self.ttl_count > 0).then(Instant::now);
+        let mut out = Vec::with_capacity(self.index.len());
+        let mut cursor = self.queue_head();
+        while let Some(idx) = cursor {
+            let node = self.nodes[idx].as_ref().expect("live slot");
+            cursor = node.next;
+            if now.is_some_and(|n| node.is_expired(n)) {
+                continue;
+            }
+            out.push(EntryView {
+                key: &node.key,
+                value: &node.value,
+                id: node.id,
+                meta: self.meta_for(node, now),
+            });
+        }
+        out
+    }
+
+    /// Builds the public metadata view of a live node.
+    ///
+    /// `now` is `None` exactly when the cache holds no deadlines (`ttl_count == 0`); since
+    /// `expires_at` is then `None` for every node, `ttl_remaining` is `None` regardless.
+    fn meta_for(&self, node: &Node<K, V>, now: Option<Instant>) -> EntryMeta {
+        EntryMeta {
+            ttl_remaining: node
+                .expires_at
+                .zip(now)
+                .map(|(at, now)| at.saturating_duration_since(now)),
+            tags: self.tags.names(&node.tags),
+        }
+    }
+
+    /// Keys of every live entry, in queue (oldest-first) order.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        // Clock skipped when no entry carries a deadline (see `get`).
+        let now = (self.ttl_count > 0).then(Instant::now);
+        let mut cursor = self.queue_head();
+        std::iter::from_fn(move || {
+            while let Some(idx) = cursor {
+                let node = self.nodes[idx].as_ref().expect("live slot");
+                cursor = node.next;
+                if !now.is_some_and(|n| node.is_expired(n)) {
+                    return Some(&node.key);
+                }
+            }
+            None
+        })
+    }
+
+    /// Every key carrying `tag`, ignoring expired entries.
+    pub fn keys_with_tag(&self, tag: &str) -> Vec<&K> {
+        // Clock skipped when no entry carries a deadline (see `get`).
+        let now = (self.ttl_count > 0).then(Instant::now);
+        self.tags
+            .members(tag)
+            .into_iter()
+            .filter_map(|idx| self.nodes[idx].as_ref())
+            .filter(|node| !now.is_some_and(|n| node.is_expired(n)))
+            .map(|node| &node.key)
+            .collect()
+    }
+
+    /// Tags currently attached to `key`.
+    pub fn tags_of<Q>(&self, key: &Q) -> Option<Vec<String>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let idx = *self.index.get(key)?;
+        Some(
+            self.tags
+                .names(&self.nodes[idx].as_ref().expect("live slot").tags),
+        )
+    }
+
+    /// `true` when `key` is present and carries `tag`.
+    #[must_use]
+    pub fn has_tag<Q>(&self, key: &Q, tag: &str) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let Some(id) = self.tags.resolve(tag) else {
+            return false;
+        };
+        self.index.get(key).is_some_and(|&idx| {
+            self.nodes[idx]
+                .as_ref()
+                .is_some_and(|n| n.tags.contains(&id))
+        })
+    }
+
+    // --------------------------------------------------------------- writes
+
+    /// Stores `key` with no TTL and no tags. See [`insert_with`](Self::insert_with).
+    pub fn insert(&mut self, key: K, value: V) {
+        self.insert_with(key, value, EntryOptions::new());
+    }
+
+    /// Stores (or replaces) `key`, returning the value it displaced.
+    ///
+    /// A `Duration::ZERO` TTL is ignored — it would expire on the next instruction and only
+    /// create a phantom entry. Callers that mean "do not cache" should simply not insert.
+    ///
+    /// Re-inserting an existing key refreshes its value, its deadline **and** its tags, and
+    /// re-queues it as the newest entry (unvisited).
+    pub fn insert_with(&mut self, key: K, value: V, options: EntryOptions) -> Option<V> {
+        self.insert_with_id(key, value, options).0
+    }
+
+    /// [`insert_with`](Self::insert_with) that also reports the entry's stable id.
+    ///
+    /// An overwrite keeps its id (only the value/TTL/tags change), so a host that stores values
+    /// by id can update in place instead of re-indexing.
+    pub fn insert_with_id(&mut self, key: K, value: V, options: EntryOptions) -> (Option<V>, u32) {
+        let existing = self.index.get(&key).copied();
+        self.insert_at(existing, Some(key), value, options)
+    }
+
+    /// [`insert_with`](Self::insert_with) that borrows the key and materialises a `K` only
+    /// when the entry is genuinely new.
+    ///
+    /// An overwrite therefore allocates no key at all — the difference matters when keys
+    /// arrive as `&str` (the wasm binding stores `String` keys but looks every one of them
+    /// up by slice first), where the owned variant would clone the key purely to throw it
+    /// away again on the very next line.
+    pub fn insert_borrowed<Q>(&mut self, key: &Q, value: V, options: EntryOptions) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized + ToOwned<Owned = K>,
+    {
+        self.insert_borrowed_id(key, value, options).0
+    }
+
+    /// [`insert_borrowed`](Self::insert_borrowed) that also reports the stable id.
+    pub fn insert_borrowed_id<Q>(
+        &mut self,
+        key: &Q,
+        value: V,
+        options: EntryOptions,
+    ) -> (Option<V>, u32)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized + ToOwned<Owned = K>,
+    {
+        match self.index.get(key).copied() {
+            Some(idx) => self.insert_at(Some(idx), None, value, options),
+            None => self.insert_at(None, Some(key.to_owned()), value, options),
+        }
+    }
+
+    /// Shared body of [`insert_with`](Self::insert_with) and
+    /// [`insert_borrowed`](Self::insert_borrowed).
+    ///
+    /// `existing` is the already-resolved index slot (`None` for a new key) so neither
+    /// caller hashes twice, and `owned` supplies the key a brand-new entry needs — `None`
+    /// on an overwrite, which must not allocate one.
+    fn insert_at(
+        &mut self,
+        existing: Option<usize>,
+        owned: Option<K>,
+        value: V,
+        options: EntryOptions,
+    ) -> (Option<V>, u32) {
+        // The clock is only needed when a TTL is actually requested — a plain write must not
+        // read the host-ticked clock just to discard the result.
+        let expires_at = options
+            .ttl_opt()
+            .filter(|ttl| !ttl.is_zero())
+            .and_then(|ttl| Instant::now().checked_add(ttl));
+
+        let (previous, id) = match existing {
+            Some(idx) => {
+                let id = self.nodes[idx].as_ref().expect("live slot").id;
+                // An overwrite never grows the index, so nothing can be swept away here:
+                // the ids interned now are exactly the ones the node ends up keeping.
+                let new_tag_ids = self
+                    .tags
+                    .intern_all(options.tags_ref().iter().map(String::as_str));
+                let old_expires_at = {
+                    let node = self.nodes[idx].as_mut().expect("live slot");
+                    let old_expires_at = node.expires_at;
+                    node.expires_at = expires_at;
+                    old_expires_at
+                };
+                // Take the old ids out so the new vector can be *moved* into the node once
+                // the diff is done. Cloning it to fill the node first would heap-allocate
+                // again on every overwrite with more than two tags.
+                let old_tag_ids =
+                    std::mem::take(&mut self.nodes[idx].as_mut().expect("live slot").tags);
+                self.shift_ttl(old_expires_at, expires_at);
+                if let Some(index) = &mut self.query_index {
+                    let key = &self.nodes[idx].as_ref().expect("live slot").key;
+                    index.on_touch(key, old_expires_at, expires_at);
+                }
+                for &id in &old_tag_ids {
+                    if !new_tag_ids.contains(&id) {
+                        self.tags.detach(id, idx);
+                    }
+                }
+                for &id in &new_tag_ids {
+                    if !old_tag_ids.contains(&id) {
+                        self.tags.attach(id, idx);
+                    }
+                }
+                self.nodes[idx].as_mut().expect("live slot").tags = new_tag_ids;
+                // A write makes the entry the newest one; it has not been visited yet.
+                self.queue.unlink(&mut self.nodes, idx);
+                self.queue.push_back(&mut self.nodes, idx);
+                (
+                    Some(std::mem::replace(
+                        &mut self.nodes[idx].as_mut().expect("live slot").value,
+                        value,
+                    )),
+                    id,
+                )
+            }
+            None => {
+                let key = owned.expect("insert_at: a new entry needs an owned key");
+                // Make room *before* publishing the node: a write must never be able to
+                // evict the entry it just created.
+                while self.index.len() >= self.capacity && self.evict_one().is_some() {}
+                // …and intern the tags only *after* that sweep. Dropping a tag's last
+                // member forgets the tag outright, so an id resolved beforehand would point
+                // at a tag that no longer exists: `attach` would silently no-op and the new
+                // entry would keep dangling ids it could never be invalidated by. Re-resolving
+                // here either finds the tag still alive or recreates it fresh.
+                let new_tag_ids = self
+                    .tags
+                    .intern_all(options.tags_ref().iter().map(String::as_str));
+                // Ids are never reused, so a stale host-side `Map<id, V>` entry cannot alias a
+                // newer cache entry. On the (astronomically unlikely) wrap, drop the old id's
+                // index row first so no two live nodes answer to the same id.
+                let id = self.next_id;
+                self.next_id = self.next_id.wrapping_add(1);
+                if self.track_ids {
+                    if let Some(old_idx) = self.by_id.remove(&id) {
+                        debug_assert!(!self.nodes[old_idx].as_ref().is_some_and(|n| n.id == id));
+                    }
+                }
+                let node = Node::new(key.clone(), value, id, expires_at, new_tag_ids);
+                let idx = match self.free.pop() {
+                    Some(idx) => {
+                        self.nodes[idx] = Some(node);
+                        idx
+                    }
+                    None => {
+                        self.nodes.push(Some(node));
+                        self.nodes.len() - 1
+                    }
+                };
+                self.index.insert(key, idx);
+                if self.track_ids {
+                    self.by_id.insert(id, idx);
+                }
+                // Read the ids back from the published node so `new_tag_ids` could be moved
+                // into it instead of cloned. The node is in the slab before we attach, so a
+                // failure here cannot leave a half-built entry registered under a tag.
+                for &id in &self.nodes[idx].as_ref().expect("live slot").tags {
+                    self.tags.attach(id, idx);
+                }
+                self.queue.push_back(&mut self.nodes, idx);
+                self.shift_ttl(None, expires_at);
+                if let Some(index) = &mut self.query_index {
+                    let key = &self.nodes[idx].as_ref().expect("live slot").key;
+                    index.on_insert(key, expires_at);
+                }
+                (None, id)
+            }
+        };
+
+        debug_assert_eq!(self.queue.len(), self.index.len(), "queue/index desync");
+        debug_assert!(
+            !self.track_ids || self.by_id.len() == self.index.len(),
+            "id/index desync"
+        );
+        (previous, id)
+    }
+
+    /// Marks `key` as recently used and optionally renews its deadline.
+    pub fn touch<Q>(&mut self, key: &Q, ttl: Option<Duration>) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let Some(&idx) = self.index.get(key) else {
+            return false;
+        };
+        let now = if self.ttl_count > 0 {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        if now.is_some_and(|n| self.nodes[idx].as_ref().expect("live slot").is_expired(n)) {
+            return false;
+        }
+        if let Some(ttl) = ttl {
+            let new = if ttl.is_zero() {
+                None
+            } else {
+                // The clock fast-path above is `None` exactly when *no* entry carries a
+                // deadline — which is the ordinary state when a first renewal happens —
+                // and a `None` here would be stored as "no deadline at all". Take the
+                // reading on demand instead of skipping it; `checked_add` overflow falls
+                // back to "never expires", the same reading `insert_with` gives an absurd
+                // TTL.
+                now.unwrap_or_else(Instant::now).checked_add(ttl)
+            };
+            let old = {
+                let n = self.nodes[idx].as_mut().expect("live slot");
+                std::mem::replace(&mut n.expires_at, new)
+            };
+            self.shift_ttl(old, new);
+            if let Some(index) = &mut self.query_index {
+                let key = &self.nodes[idx].as_ref().expect("live slot").key;
+                index.on_touch(key, old, new);
+            }
+        }
+        {
+            let n = self.nodes[idx].as_mut().expect("live slot");
+            n.visited = true;
+        }
+        true
+    }
+
+    /// Removes `key`, returning its value.
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        // One hash total: the index entry goes away under the caller's key, so `release`
+        // must not re-hash `node.key` on the way out — the old path hashed the same key a
+        // second time on every delete.
+        let idx = self.index.remove(key)?;
+        self.unlink(idx);
+        let (_, value, _) = self.release(idx, false);
+        self.stats.invalidations += 1;
+        Some(value)
+    }
+
+    /// Removes every entry carrying any of `tags`, returning the removed keys.
+    ///
+    /// Runs in `O(total members)` — no scan of the whole cache.
+    pub fn invalidate_tags<I, S>(&mut self, tags: I) -> Vec<K>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut members: HashSet<usize> = HashSet::new();
+        for tag in tags {
+            members.extend(self.tags.members(tag.as_ref()));
+        }
+        let mut removed = Vec::with_capacity(members.len());
+        for idx in members {
+            let (key, _, _) = self.free(idx);
+            removed.push(key);
+        }
+        self.stats.invalidations += removed.len() as u64;
+        removed
+    }
+
+    /// Removes every entry whose TTL elapsed, returning the removed keys.
+    ///
+    /// Expired entries are also reclaimed lazily on access and opportunistically during
+    /// eviction; call this when you want the cache *observed* to be clean right now.
+    pub fn prune(&mut self) -> Vec<K> {
+        // No deadline anywhere → nothing can be expired: skip the clock *and* the scan.
+        if self.ttl_count == 0 {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let expired: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| slot.as_ref().filter(|n| n.is_expired(now)).map(|_| idx))
+            .collect();
+        let mut removed = Vec::with_capacity(expired.len());
+        for idx in expired {
+            let (key, _, _) = self.free(idx);
+            removed.push(key);
+        }
+        self.stats.expirations += removed.len() as u64;
+        removed
+    }
+
+    /// Drops everything and counts the dropped entries as invalidations.
+    pub fn clear(&mut self) {
+        let dropped = self.index.len() as u64;
+        self.nodes.clear();
+        self.free.clear();
+        self.index.clear();
+        if self.track_ids {
+            self.by_id.clear();
+        }
+        self.queue = Sieve::new();
+        self.tags.clear();
+        if let Some(index) = &mut self.query_index {
+            index.clear();
+        }
+        // `release()` never runs for these nodes, so reset the fast-path counter here.
+        self.ttl_count = 0;
+        self.stats.invalidations += dropped;
+    }
+
+    // ------------------------------------------------------------- internals
+
+    /// Applies a deadline change to the fast-path counter: `old` → `new`.
+    ///
+    /// Every path that sets, replaces or drops an entry's `expires_at` funnels through here,
+    /// so the invariant "*`ttl_count` equals the number of nodes holding a deadline*" holds
+    /// by construction rather than by scattered `+= 1`s. Callers pass `None` for a deadline
+    /// that is being removed (or for a brand-new entry that has one).
+    fn shift_ttl(&mut self, old: Option<Instant>, new: Option<Instant>) {
+        self.ttl_count += new.is_some() as usize;
+        self.ttl_count -= old.is_some() as usize;
+        debug_assert!(
+            self.ttl_count <= self.index.len(),
+            "ttl_count exceeds stored entries"
+        );
+    }
+
+    /// Oldest-first entry point for iteration (the SIEVE queue head).
+    fn queue_head(&self) -> Option<usize> {
+        self.queue.head()
+    }
+
+    /// Unlinks `idx` if it is still linked, then frees its slab slot.
+    fn free(&mut self, idx: usize) -> (K, V, u32) {
+        self.unlink(idx);
+        self.release(idx, true)
+    }
+
+    /// Unlinks `idx` from the SIEVE queue when it is still linked.
+    fn unlink(&mut self, idx: usize) {
+        if self.queue.is_linked(&self.nodes, idx) {
+            self.queue.unlink(&mut self.nodes, idx);
+        }
+    }
+
+    /// Removes `idx` from the slab. The caller must have unlinked it already.
+    ///
+    /// `indexed` says whether the index still maps the key to `idx`: `false` when the
+    /// caller already removed the entry under its own query key (see [`remove`](Self::remove)),
+    /// which is what keeps a delete down to a single hash of the key.
+    fn release(&mut self, idx: usize, indexed: bool) -> (K, V, u32) {
+        let node = self.nodes[idx].take().expect("release of a free slot");
+        // Single point where an entry dies: keep the fast-path counter in step.
+        self.shift_ttl(node.expires_at, None);
+        if let Some(index) = &mut self.query_index {
+            index.on_remove(&node.key, node.expires_at);
+        }
+        if indexed {
+            self.index.remove(&node.key);
+        }
+        if self.track_ids {
+            self.by_id.remove(&node.id);
+        }
+        for &id in &node.tags {
+            self.tags.detach(id, idx);
+        }
+        self.free.push(idx);
+        (node.key, node.value, node.id)
+    }
+
+    /// Applies SIEVE once and counts *why* the entry died.
+    ///
+    /// The dropped pair goes to the drop log when tracking is on; otherwise it is released.
+    /// Neither caller needs the value back (both only care that *something* died), which is
+    /// what makes handing ownership to the log free.
+    fn evict_one(&mut self) -> Option<()> {
+        // No deadline anywhere → nothing can be expired, so the sweep takes no clock (the
+        // hand's visited-bit logic is time-independent). See `get` for the rationale.
+        let now = (self.ttl_count > 0).then(Instant::now);
+        let idx = self.queue.evict_candidate(&mut self.nodes, now)?;
+        let was_expired =
+            now.is_some_and(|now| self.nodes[idx].as_ref().expect("live slot").is_expired(now));
+        let (key, value, id) = self.release(idx, true); // `evict_candidate` already unlinked it
+        if was_expired {
+            self.stats.expirations += 1;
+            self.log_drop(id, key, value, DropReason::Expired);
+        } else {
+            self.stats.evictions += 1;
+            self.log_drop(id, key, value, DropReason::Evicted);
+        }
+        Some(())
+    }
+}
+
+fn ttl_remaining<K, V>(node: &Node<K, V>, now: Option<Instant>) -> Option<Duration> {
+    node.expires_at
+        .zip(now)
+        .map(|(at, now)| at.saturating_duration_since(now))
+}
+
+impl<K, V> Default for Cache<K, V>
+where
+    K: Clone + Hash + Eq,
+{
+    fn default() -> Self {
+        Self::new(DEFAULT_CAPACITY)
+    }
+}
+
+/// Opt-in query surface. Limited to string keys — the host the wasm binding uses — so the
+/// generic cache keeps its original bounds and an opted-out cache keeps its exact layout.
+impl<V> Cache<String, V> {
+    /// Builds the ordered key, expiry and tag-backed query indexes and backfills them from
+    /// any entries already present. Idempotent.
+    pub fn enable_indexes(&mut self) {
+        if self.query_index.is_some() {
+            return;
+        }
+        let mut index = StringQueryIndex::default();
+        for node in self.nodes.iter().flatten() {
+            index.on_insert(&node.key, node.expires_at);
+        }
+        self.query_index = Some(Box::new(index));
+    }
+
+    /// `true` once [`enable_indexes`](Self::enable_indexes) has been called.
+    #[must_use]
+    pub fn indexes_enabled(&self) -> bool {
+        self.query_index.is_some()
+    }
+
+    /// Number of keys registered in the ordered index, or `None` when indexes are off.
+    /// Used by invariant tests and hosts that want a cheap index size.
+    #[must_use]
+    pub fn indexed_key_count(&self) -> Option<usize> {
+        self.query_index.as_ref().map(|index| index.len())
+    }
+
+    /// All indexed keys ordered by deadline (soonest first), permanent keys last.
+    /// The TTL-range filter uses the same index through `deadline_of`; this accessor
+    /// exposes the ordering itself to Rust callers.
+    #[must_use]
+    pub fn ttl_ordered_keys(&self) -> Vec<String> {
+        self.query_index
+            .as_ref()
+            .map(|index| index.ttl_ordered_keys().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Resolves tag names to interned ids. Unknown tags map to `u32::MAX` (never a real
+    /// id) so a host that caches ids can detect them without consulting the index again.
+    #[must_use]
+    pub fn tag_ids(&self, names: &[String]) -> Vec<u32> {
+        names
+            .iter()
+            .map(|name| self.tags.resolve(name).unwrap_or(u32::MAX))
+            .collect()
+    }
+
+    /// Runs a bounded query, returning metadata only. Callers opt in to values separately
+    /// (and cap them); this method never hands out a live value reference.
+    ///
+    /// Stops at the first match past the page unless `with_total` was requested — a
+    /// paged query must not pay for matches it will never return.
+    pub fn query_keys(&self, filter: &QueryFilter<'_>) -> Result<QueryKeysResult, QueryError> {
+        let index = self
+            .query_index
+            .as_deref()
+            .ok_or(QueryError::IndexesDisabled)?;
+        if filter.limit == 0 {
+            return Err(QueryError::InvalidLimit);
+        }
+        let now = Instant::now();
+        let mut rows = Vec::new();
+        let mut total = 0usize;
+        let mut more = false;
+
+        for key in Self::query_candidates(index, filter) {
+            // Beyond the page a match only has to be *counted* (when asked), never built.
+            let want_row = rows.len() < filter.limit;
+            let Some((ttl_ms, tags)) = self.query_match(index, key, now, filter, want_row) else {
+                continue;
+            };
+            if filter.with_total {
+                total += 1;
+            }
+            if want_row {
+                rows.push(QueryRow {
+                    key: key.to_owned(),
+                    ttl_ms,
+                    tags,
+                });
+            } else {
+                // The page is full: one more match proves a next page exists. Only a
+                // caller that asked for the total keeps scanning past this point.
+                more = true;
+                if !filter.with_total {
+                    break;
+                }
+            }
+        }
+
+        let next_cursor = if more {
+            rows.last().map(|row| row.key.clone())
+        } else {
+            None
+        };
+        Ok(QueryKeysResult {
+            rows,
+            next_cursor,
+            total,
+        })
+    }
+
+    /// Number of matches, ignoring paging. A setup guard, not a hot-path API: it walks
+    /// candidates without materialising a single row — no key clones, and no tag vectors
+    /// unless a tag constraint actually needs them.
+    pub fn query_count(&self, filter: &QueryFilter<'_>) -> Result<usize, QueryError> {
+        let index = self
+            .query_index
+            .as_deref()
+            .ok_or(QueryError::IndexesDisabled)?;
+        // Paging never narrows a count: drop the anchor exactly as the previous
+        // row-materialising implementation did.
+        let flat = QueryFilter {
+            cursor: None,
+            ..*filter
+        };
+        let now = Instant::now();
+        let mut total = 0usize;
+        for key in Self::query_candidates(index, &flat) {
+            if self.query_match(index, key, now, &flat, false).is_some() {
+                total += 1;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Candidate keys for `filter` in ascending order, via the cheapest strategy that
+    /// still yields exactly the indexed set.
+    ///
+    /// A small allow-list is sorted and walked directly (O(m log m)) instead of probing
+    /// every indexed key against it (O(n)); a list that is not clearly smaller than the
+    /// index — or any query carrying a prefix, which already bounds the index path to
+    /// one contiguous region — keeps the indexed path. That path seeks with
+    /// [`Bound::Excluded`] for a cursor / [`Bound::Included`] for a prefix and stops at
+    /// the end of the prefix region rather than scanning to the end of the index.
+    fn query_candidates<'a>(
+        index: &'a dyn QueryIndex<String>,
+        filter: &'a QueryFilter<'a>,
+    ) -> Box<dyn Iterator<Item = &'a str> + 'a> {
+        let start = match (filter.cursor, filter.prefix) {
+            // A cursor before the prefix region adds nothing the prefix bound misses.
+            (Some(cursor), Some(prefix)) if prefix > cursor => Bound::Included(prefix),
+            (Some(cursor), _) => Bound::Excluded(cursor),
+            (None, Some(prefix)) => Bound::Included(prefix),
+            (None, None) => Bound::Unbounded,
+        };
+        let prefix = filter.prefix;
+
+        if let Some(keys) = filter.keys {
+            if keys.is_empty() {
+                return Box::new(std::iter::empty());
+            }
+            if prefix.is_none() && keys.len().saturating_mul(6) <= index.len() {
+                let mut sorted: Vec<&str> = keys.iter().map(String::as_str).collect();
+                sorted.sort_unstable();
+                sorted.dedup();
+                let from = match filter.cursor {
+                    Some(cursor) => sorted.partition_point(|key| *key <= cursor),
+                    None => 0,
+                };
+                return Box::new(sorted.into_iter().skip(from));
+            }
+            let allow: HashSet<&str> = keys.iter().map(String::as_str).collect();
+            let iter = index
+                .ordered_range(start)
+                .filter(move |key| allow.contains(key));
+            return match prefix {
+                Some(prefix) => Box::new(iter.take_while(move |key| key.starts_with(prefix))),
+                None => Box::new(iter),
+            };
+        }
+
+        let iter = index.ordered_range(start);
+        match prefix {
+            Some(prefix) => Box::new(iter.take_while(move |key| key.starts_with(prefix))),
+            None => Box::new(iter),
+        }
+    }
+
+    /// Liveness, TTL bounds and tag constraints for one candidate key; the row payload
+    /// (`ttl_ms`, `tags`) when it matches, `None` otherwise.
+    ///
+    /// `need_row` separates a paging query — which always materialises both fields —
+    /// from a count, which skips the `tags_of` allocation unless a tag constraint needs
+    /// it. `peek` is observational: no hit/miss stats, no visited bit, no reclamation.
+    /// Expired-but-unreclaimed keys are skipped here just like `keys()` skips them.
+    fn query_match(
+        &self,
+        index: &dyn QueryIndex<String>,
+        key: &str,
+        now: Instant,
+        filter: &QueryFilter<'_>,
+        need_row: bool,
+    ) -> Option<(Option<f64>, Vec<String>)> {
+        // `peek` is observational: no hit/miss stats, no visited bit, no reclamation.
+        // Expired-but-unreclaimed keys are skipped here just like `keys()` skips them.
+        self.peek(key)?;
+        let ttl_constrained = filter.ttl_min_ms.is_some() || filter.ttl_max_ms.is_some();
+        let ttl_ms = if need_row || ttl_constrained {
+            index
+                .deadline_of(key)
+                .map(|at| at.saturating_duration_since(now).as_secs_f64() * 1000.0)
+        } else {
+            None
+        };
+        if let Some(min) = filter.ttl_min_ms {
+            // A permanent key has an infinite remaining TTL: it satisfies every lower bound.
+            if ttl_ms.is_some_and(|remaining| remaining < min) {
+                return None;
+            }
+        }
+        if let Some(max) = filter.ttl_max_ms {
+            // …but no upper bound, so an upper-bounded query excludes it.
+            if ttl_ms.is_none_or(|remaining| remaining > max) {
+                return None;
+            }
+        }
+        let tag_constrained = !filter.tags_any.is_empty()
+            || !filter.tags_all.is_empty()
+            || !filter.tags_none.is_empty();
+        let tags = if need_row || tag_constrained {
+            self.tags_of(key).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !filter.tags_any.is_empty() && !filter.tags_any.iter().any(|t| tags.contains(t)) {
+            return None;
+        }
+        if !filter.tags_all.is_empty() && !filter.tags_all.iter().all(|t| tags.contains(t)) {
+            return None;
+        }
+        if !filter.tags_none.is_empty() && filter.tags_none.iter().any(|t| tags.contains(t)) {
+            return None;
+        }
+        Some((ttl_ms, tags))
+    }
+}
+
+#[cfg(test)]
+mod query_tests;
+#[cfg(test)]
+mod stress;
+#[cfg(test)]
+mod tests;

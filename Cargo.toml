@@ -1,7 +1,7 @@
 [package]
 name = "blaze-cache-wasm"
-description = "Independent WebAssembly binding layer for Blaze Cache (0.1.0 foundation)"
-version = "0.1.0"
+description = "Independent WebAssembly binding layer for Blaze Cache (flat loom-abi-v2, no generated glue)"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -12,11 +12,19 @@ keywords = ["wasm", "cache", "bindings"]
 categories = ["wasm"]
 
 # `cdylib` is what a Wasm toolchain loads; `rlib` keeps host `cargo test` and `cargo check`
-# working. No binding-ABI dependency is selected yet — see docs/plan/0.1.0.md.
+# working. The binding ABI is the flat raw surface `loom-abi-v2` (`ABI_VERSION = 1`) —
+# see docs/plan/0.2.0.md and docs/decisions/0004-abi-v2.md.
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# Vendored blaze-cache-core's deps, pinned to upstream's Cargo.lock resolutions —
+# see docs/decisions/engine-provenance.md. Kept in sync by scripts/sync-core.sh.
+foldhash = "0.2"
+serde = { version = "1", features = ["derive"] }
+smallvec = { version = "1", features = ["serde"] }
+# NOTE: no `web-time`. Its wasm32 backend is wasm-bindgen + js-sys glue (ADR-0001 forbids
+# it); wasm time comes from `__blaze_tick` via src/clock.rs instead — see ADR-0002.
 
 [dev-dependencies]
 
